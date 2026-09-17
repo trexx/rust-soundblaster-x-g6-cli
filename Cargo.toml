@@ -1,20 +1,15 @@
 [package]
 name = "g6-cli"
-version = "0.0.3"
+version = "0.1.0"
 edition = "2021"
+rust-version = "1.83"
 description = "CLI tool for controlling the SoundBlaster X G6 on Windows"
 license = "GPL-2.0-only"
-
-[lib]
-name = "g6_cli"
-path = "src/lib.rs"
-
-[[bin]]
-name = "g6-cli"
-path = "src/main.rs"
+readme = "readme.md"
+repository = "https://github.com/trexx/rust-soundblaster-x-g6-cli"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 hidapi = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,8 +1,16 @@
+//! Wire format of the G6 HID protocol: frame layout, value encoding and feature ids.
+//!
+//! Every numeric value the G6 accepts is a little-endian IEEE-754 `f32` (sliders are
+//! `0.0..=1.0`, discrete modes are small whole numbers such as `1.0`, `2.0`, `3.0`), except
+//! mic boost, which is a little-endian `u32` of the dB value.
+
 pub mod decoder;
 pub mod lighting;
 pub mod playback;
 pub mod recording;
 pub mod sbx;
+
+use serde::{Deserialize, Serialize};
 
 // Static frame constants
 pub const STATIC_PREFIX: u8 = 0x5A;
@@ -15,7 +23,7 @@ pub const EMPTY_ADDITIONAL: [u8; 54] = [0u8; 54];
 
 /// A 64-byte HID payload. Sent to the device prepended with a 0x00 report ID byte (65 bytes total).
 /// Layout: PREFIX(1) | mode(2) | intermediate(2) | audio_feature(1) | value(4) | additional(54) = 64
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HidFrame {
     pub mode: [u8; 2],
     pub intermediate: [u8; 2],
@@ -25,6 +33,8 @@ pub struct HidFrame {
 }
 
 impl HidFrame {
+    pub const LEN: usize = 64;
+
     pub fn new(
         mode: [u8; 2],
         intermediate: [u8; 2],
@@ -32,60 +42,95 @@ impl HidFrame {
         value: [u8; 4],
         additional: [u8; 54],
     ) -> Self {
-        Self { mode, intermediate, audio_feature, value, additional }
+        Self {
+            mode,
+            intermediate,
+            audio_feature,
+            value,
+            additional,
+        }
     }
 
     /// Standard playback/SBX frame using PLAYBACK_INTERMEDIATE.
     pub fn playback(mode: [u8; 2], audio_feature: u8, value: [u8; 4]) -> Self {
-        Self::new(mode, PLAYBACK_INTERMEDIATE, audio_feature, value, EMPTY_ADDITIONAL)
+        Self::new(
+            mode,
+            PLAYBACK_INTERMEDIATE,
+            audio_feature,
+            value,
+            EMPTY_ADDITIONAL,
+        )
     }
 
     /// Standard recording frame using RECORDING_INTERMEDIATE.
     pub fn recording(mode: [u8; 2], audio_feature: u8, value: [u8; 4]) -> Self {
-        Self::new(mode, RECORDING_INTERMEDIATE, audio_feature, value, EMPTY_ADDITIONAL)
+        Self::new(
+            mode,
+            RECORDING_INTERMEDIATE,
+            audio_feature,
+            value,
+            EMPTY_ADDITIONAL,
+        )
     }
 
     /// Standard decoder frame using DECODER_INTERMEDIATE.
     pub fn decoder(mode: [u8; 2], audio_feature: u8, value: [u8; 4]) -> Self {
-        Self::new(mode, DECODER_INTERMEDIATE, audio_feature, value, EMPTY_ADDITIONAL)
+        Self::new(
+            mode,
+            DECODER_INTERMEDIATE,
+            audio_feature,
+            value,
+            EMPTY_ADDITIONAL,
+        )
     }
 
-    pub fn to_bytes(&self) -> [u8; 64] {
-        let mut buf = [0u8; 64];
+    pub fn to_bytes(&self) -> [u8; Self::LEN] {
+        let mut buf = [0u8; Self::LEN];
         buf[0] = STATIC_PREFIX;
-        buf[1] = self.mode[0];
-        buf[2] = self.mode[1];
-        buf[3] = self.intermediate[0];
-        buf[4] = self.intermediate[1];
+        buf[1..3].copy_from_slice(&self.mode);
+        buf[3..5].copy_from_slice(&self.intermediate);
         buf[5] = self.audio_feature;
-        buf[6] = self.value[0];
-        buf[7] = self.value[1];
-        buf[8] = self.value[2];
-        buf[9] = self.value[3];
-        buf[10..64].copy_from_slice(&self.additional);
+        buf[6..10].copy_from_slice(&self.value);
+        buf[10..].copy_from_slice(&self.additional);
         buf
     }
 
     pub fn to_hex(&self) -> String {
-        self.to_bytes().iter().map(|b| format!("{:02x}", b)).collect()
+        self.to_bytes().iter().map(|b| format!("{b:02x}")).collect()
     }
+}
+
+// ── Value encoding ────────────────────────────────────────────────────────────
+
+/// Encode a value as the little-endian IEEE-754 `f32` the G6 uses in its value field.
+pub const fn f32_bytes(v: f32) -> [u8; 4] {
+    v.to_le_bytes()
+}
+
+/// Percent `0..=100` → value bytes for SBX sliders and on/off toggles (`0.0` at 0 %, `1.0` at 100 %).
+///
+/// # Panics
+/// If `pct > 100`.
+pub fn slider_percent_bytes(pct: u8) -> [u8; 4] {
+    assert!(pct <= 100, "slider percent must be 0..=100, got {pct}");
+    f32_bytes(f32::from(pct) / 100.0)
 }
 
 // ── SBX audio feature bytes ──────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioFeature {
-    SurroundToggle    = 0x00,
-    SurroundSlider    = 0x01,
-    DialogPlusToggle  = 0x02,
-    DialogPlusSlider  = 0x03,
+    SurroundToggle = 0x00,
+    SurroundSlider = 0x01,
+    DialogPlusToggle = 0x02,
+    DialogPlusSlider = 0x03,
     SmartVolumeToggle = 0x04,
     SmartVolumeSlider = 0x05,
     SmartVolumeSpecial = 0x06,
     CrystalizerToggle = 0x07,
     CrystalizerSlider = 0x08,
-    BassToggle        = 0x18,
-    BassSlider        = 0x19,
+    BassToggle = 0x18,
+    BassSlider = 0x19,
 }
 
 impl AudioFeature {
@@ -94,35 +139,51 @@ impl AudioFeature {
     }
 }
 
-// ── PlaybackFilter ────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
-pub enum PlaybackFilter {
-    #[value(name = "fast-min")]
-    FastRollOffMinimumPhase,
-    #[value(name = "slow-min")]
-    SlowRollOffMinimumPhase,
-    #[value(name = "fast-lin")]
-    FastRollOffLinearPhase,
-    #[value(name = "slow-lin")]
-    SlowRollOffLinearPhase,
+/// One SBX sound effect. Each has an on/off toggle and a 0–100 strength slider;
+/// Smart Volume additionally has the Night/Loud special modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SbxEffect {
+    Surround,
+    Crystalizer,
+    Bass,
+    SmartVolume,
+    DialogPlus,
 }
 
-impl PlaybackFilter {
-    /// The filter value is used as the HID frame's *intermediate* field, not the value field.
-    pub fn intermediate_bytes(self) -> [u8; 2] {
+impl SbxEffect {
+    /// All effects, in the order a profile switch sends them.
+    pub const ALL: [SbxEffect; 5] = [
+        Self::Surround,
+        Self::Crystalizer,
+        Self::Bass,
+        Self::SmartVolume,
+        Self::DialogPlus,
+    ];
+
+    pub fn toggle_feature(self) -> AudioFeature {
         match self {
-            Self::FastRollOffMinimumPhase => [0x00, 0x01],
-            Self::SlowRollOffMinimumPhase => [0x00, 0x02],
-            Self::FastRollOffLinearPhase  => [0x00, 0x04],
-            Self::SlowRollOffLinearPhase  => [0x00, 0x05],
+            Self::Surround => AudioFeature::SurroundToggle,
+            Self::Crystalizer => AudioFeature::CrystalizerToggle,
+            Self::Bass => AudioFeature::BassToggle,
+            Self::SmartVolume => AudioFeature::SmartVolumeToggle,
+            Self::DialogPlus => AudioFeature::DialogPlusToggle,
+        }
+    }
+
+    pub fn slider_feature(self) -> AudioFeature {
+        match self {
+            Self::Surround => AudioFeature::SurroundSlider,
+            Self::Crystalizer => AudioFeature::CrystalizerSlider,
+            Self::Bass => AudioFeature::BassSlider,
+            Self::SmartVolume => AudioFeature::SmartVolumeSlider,
+            Self::DialogPlus => AudioFeature::DialogPlusSlider,
         }
     }
 }
 
 // ── SmartVolumeSpecial ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum SmartVolumeSpecial {
     Night,
     Loud,
@@ -130,149 +191,39 @@ pub enum SmartVolumeSpecial {
 
 impl SmartVolumeSpecial {
     pub fn value_bytes(self) -> [u8; 4] {
+        f32_bytes(match self {
+            Self::Night => 2.0,
+            Self::Loud => 1.0,
+        })
+    }
+}
+
+// ── PlaybackFilter ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+pub enum PlaybackFilter {
+    /// Fast roll-off, minimum phase
+    #[value(name = "fast-min")]
+    FastMinimum,
+    /// Slow roll-off, minimum phase
+    #[value(name = "slow-min")]
+    SlowMinimum,
+    /// Fast roll-off, linear phase
+    #[value(name = "fast-lin")]
+    FastLinear,
+    /// Slow roll-off, linear phase
+    #[value(name = "slow-lin")]
+    SlowLinear,
+}
+
+impl PlaybackFilter {
+    /// The filter value is used as the HID frame's *intermediate* field, not the value field.
+    pub fn intermediate_bytes(self) -> [u8; 2] {
         match self {
-            Self::Night => [0x00, 0x00, 0x00, 0x40],
-            Self::Loud  => [0x00, 0x00, 0x80, 0x3f],
+            Self::FastMinimum => [0x00, 0x01],
+            Self::SlowMinimum => [0x00, 0x02],
+            Self::FastLinear => [0x00, 0x04],
+            Self::SlowLinear => [0x00, 0x05],
         }
     }
 }
-
-// ── Slider / boost lookup tables ──────────────────────────────────────────────
-
-/// Percent 0..=100 → 4-byte little-endian float value used by the G6 for SBX sliders.
-pub fn slider_percent_bytes(pct: u8) -> [u8; 4] {
-    assert!(pct <= 100, "slider percent must be 0..=100");
-    SLIDER_PERCENT_TABLE[pct as usize]
-}
-
-/// Decibel boost 0|10|20|30 → 4-byte value for mic boost.
-pub fn mic_boost_bytes(db: u8) -> [u8; 4] {
-    match db {
-        0  => [0x00, 0x00, 0x00, 0x00],
-        10 => [0x0a, 0x00, 0x00, 0x00],
-        20 => [0x14, 0x00, 0x00, 0x00],
-        30 => [0x1e, 0x00, 0x00, 0x00],
-        _  => panic!("mic boost must be 0, 10, 20, or 30 dB"),
-    }
-}
-
-/// Voice-clarity noise-reduction level 0|20|40|60|80|100 → 4-byte value.
-pub fn voice_clarity_level_bytes(level: u8) -> [u8; 4] {
-    match level {
-        0   => [0x00, 0x00, 0x00, 0x00],
-        20  => [0xcd, 0xcc, 0xcc, 0x3d],
-        40  => [0xcd, 0xcc, 0x4c, 0x3e],
-        60  => [0x9a, 0x99, 0x99, 0x3e],
-        80  => [0xcd, 0xcc, 0xcc, 0x3e],
-        100 => [0x00, 0x00, 0x00, 0x3f],
-        _   => panic!("voice clarity level must be 0, 20, 40, 60, 80, or 100"),
-    }
-}
-
-// ── Slider percent lookup table (0..=100) ─────────────────────────────────────
-// Ported verbatim from g6_spec/__init__.py __slider_percent_to_bytes_dict.
-// Values are 4-byte little-endian IEEE-754 floats (0.0 at 0%, 1.0 at 100%).
-#[rustfmt::skip]
-static SLIDER_PERCENT_TABLE: [[u8; 4]; 101] = [
-    [0x00, 0x00, 0x00, 0x00], // 0
-    [0x0a, 0xd7, 0x23, 0x3c], // 1
-    [0x0a, 0xd7, 0xa3, 0x3c], // 2
-    [0x8f, 0xc2, 0xf5, 0x3c], // 3
-    [0x0a, 0xd7, 0x23, 0x3d], // 4
-    [0xcd, 0xcc, 0x4c, 0x3d], // 5
-    [0x8f, 0xc2, 0x75, 0x3d], // 6
-    [0x29, 0x5c, 0x8f, 0x3d], // 7
-    [0x0a, 0xd7, 0xa3, 0x3d], // 8
-    [0xec, 0x51, 0xb8, 0x3d], // 9
-    [0xcd, 0xcc, 0xcc, 0x3d], // 10
-    [0xae, 0x47, 0xe1, 0x3d], // 11
-    [0x8f, 0xc2, 0xf5, 0x3d], // 12
-    [0xb8, 0x1e, 0x05, 0x3e], // 13
-    [0x29, 0x5c, 0x0f, 0x3e], // 14
-    [0x9a, 0x99, 0x19, 0x3e], // 15
-    [0x0a, 0xd7, 0x23, 0x3e], // 16
-    [0x7b, 0x14, 0x2e, 0x3e], // 17
-    [0xec, 0x51, 0x38, 0x3e], // 18
-    [0x5c, 0x8f, 0x42, 0x3e], // 19
-    [0xcd, 0xcc, 0x4c, 0x3e], // 20
-    [0x3d, 0x0a, 0x57, 0x3e], // 21
-    [0xae, 0x47, 0x61, 0x3e], // 22
-    [0x1f, 0x85, 0x6b, 0x3e], // 23
-    [0x8f, 0xc2, 0x75, 0x3e], // 24
-    [0x00, 0x00, 0x80, 0x3e], // 25
-    [0xb8, 0x1e, 0x85, 0x3e], // 26
-    [0x71, 0x3d, 0x8a, 0x3e], // 27
-    [0x29, 0x5c, 0x8f, 0x3e], // 28
-    [0xe1, 0x7a, 0x94, 0x3e], // 29
-    [0x9a, 0x99, 0x99, 0x3e], // 30
-    [0x52, 0xb8, 0x9e, 0x3e], // 31
-    [0x0a, 0xd7, 0xa3, 0x3e], // 32
-    [0xc3, 0xf5, 0xa8, 0x3e], // 33
-    [0x7b, 0x14, 0xae, 0x3e], // 34
-    [0x33, 0x33, 0xb3, 0x3e], // 35
-    [0xec, 0x51, 0xb8, 0x3e], // 36
-    [0xa4, 0x70, 0xbd, 0x3e], // 37
-    [0x5c, 0x8f, 0xc2, 0x3e], // 38
-    [0x14, 0xae, 0xc7, 0x3e], // 39
-    [0xcd, 0xcc, 0xcc, 0x3e], // 40
-    [0x85, 0xeb, 0xd1, 0x3e], // 41
-    [0x3d, 0x0a, 0xd7, 0x3e], // 42
-    [0xf6, 0x28, 0xdc, 0x3e], // 43
-    [0xae, 0x47, 0xe1, 0x3e], // 44
-    [0x66, 0x66, 0xe6, 0x3e], // 45
-    [0x1f, 0x85, 0xeb, 0x3e], // 46
-    [0xd7, 0xa3, 0xf0, 0x3e], // 47
-    [0x8f, 0xc2, 0xf5, 0x3e], // 48
-    [0x48, 0xe1, 0xfa, 0x3e], // 49
-    [0x00, 0x00, 0x00, 0x3f], // 50
-    [0x5c, 0x8f, 0x02, 0x3f], // 51
-    [0xb8, 0x1e, 0x05, 0x3f], // 52
-    [0x14, 0xae, 0x07, 0x3f], // 53
-    [0x71, 0x3d, 0x0a, 0x3f], // 54
-    [0xcd, 0xcc, 0x0c, 0x3f], // 55
-    [0x29, 0x5c, 0x0f, 0x3f], // 56
-    [0x85, 0xeb, 0x11, 0x3f], // 57
-    [0xe1, 0x7a, 0x14, 0x3f], // 58
-    [0x3d, 0x0a, 0x17, 0x3f], // 59
-    [0x9a, 0x99, 0x19, 0x3f], // 60
-    [0xf6, 0x28, 0x1c, 0x3f], // 61
-    [0x52, 0xb8, 0x1e, 0x3f], // 62
-    [0xae, 0x47, 0x21, 0x3f], // 63
-    [0x0a, 0xd7, 0x23, 0x3f], // 64
-    [0x66, 0x66, 0x26, 0x3f], // 65
-    [0xc3, 0xf5, 0x28, 0x3f], // 66
-    [0x1f, 0x85, 0x2b, 0x3f], // 67
-    [0x7b, 0x14, 0x2e, 0x3f], // 68
-    [0xd7, 0xa3, 0x30, 0x3f], // 69
-    [0x33, 0x33, 0x33, 0x3f], // 70
-    [0x8f, 0xc2, 0x35, 0x3f], // 71
-    [0xec, 0x51, 0x38, 0x3f], // 72
-    [0x48, 0xe1, 0x3a, 0x3f], // 73
-    [0xa4, 0x70, 0x3d, 0x3f], // 74
-    [0x00, 0x00, 0x40, 0x3f], // 75
-    [0x5c, 0x8f, 0x42, 0x3f], // 76
-    [0xb8, 0x1e, 0x45, 0x3f], // 77
-    [0x14, 0xae, 0x47, 0x3f], // 78
-    [0x71, 0x3d, 0x4a, 0x3f], // 79
-    [0xcd, 0xcc, 0x4c, 0x3f], // 80
-    [0x29, 0x5c, 0x4f, 0x3f], // 81
-    [0x85, 0xeb, 0x51, 0x3f], // 82
-    [0xe1, 0x7a, 0x54, 0x3f], // 83
-    [0x3d, 0x0a, 0x57, 0x3f], // 84
-    [0x9a, 0x99, 0x59, 0x3f], // 85
-    [0xf6, 0x28, 0x5c, 0x3f], // 86
-    [0x52, 0xb8, 0x5e, 0x3f], // 87
-    [0xae, 0x47, 0x61, 0x3f], // 88
-    [0x0a, 0xd7, 0x63, 0x3f], // 89
-    [0x66, 0x66, 0x66, 0x3f], // 90
-    [0xc3, 0xf5, 0x68, 0x3f], // 91
-    [0x1f, 0x85, 0x6b, 0x3f], // 92
-    [0x7b, 0x14, 0x6e, 0x3f], // 93
-    [0xd7, 0xa3, 0x70, 0x3f], // 94
-    [0x33, 0x33, 0x73, 0x3f], // 95
-    [0x8f, 0xc2, 0x75, 0x3f], // 96
-    [0xec, 0x51, 0x78, 0x3f], // 97
-    [0x48, 0xe1, 0x7a, 0x3f], // 98
-    [0xa4, 0x70, 0x7d, 0x3f], // 99
-    [0x00, 0x00, 0x80, 0x3f], // 100
-];
