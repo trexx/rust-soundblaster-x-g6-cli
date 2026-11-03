@@ -10,3 +10,7 @@ jobs:
     secrets: 'inherit'
     permissions:
       contents: write
+    with:
+      files: |
+        target/release/g6-cli.exe
+        target/release/g6-watch.exe
